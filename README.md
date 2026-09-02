@@ -28,9 +28,9 @@ not be.
 - **Paced.** Polling runs on a 5-minute cycle across a small list of rooms.
   Backfill pages sleep 3 s between requests. Both stay far inside the
   documented read budget (600 reads/min).
-- **Backfill is one-shot and slow.** On first run per room, the collector
-  drains only what still survives in that room's ring buffer, oldest-first,
-  one room at a time.
+- **Backfill is one-shot.** On first setup per room, `--backfill` archives
+  `GET /r/{room}/export` once (raw always kept; parsed when the format
+  allows), one room at a time.
 - **Coverage is recorded honestly.** When messages are evicted before we can
   read them, the missing seq range is stored in `coverage_gaps` and any
   published number will be reported as a floor ("at least this much"), next
@@ -49,9 +49,11 @@ python3 collector.py --loop                  # then poll every 5 minutes
 Observation points live in `rooms.json` and are reloaded every cycle, so new
 rooms (e.g. wherever HTLC receipts land) can be added without a restart.
 
-Before first run, verify the `FIELD MAPPING` and `PAGINATION` constants at
-the top of `collector.py` against `https://technocore.chat/openapi.json` and
-one real room response.
+Field mapping and paging were verified against the live API and
+`/openapi.json` on 2026-09-02: forward paging via `since` (no backward
+paging exists), `n` as cache-buster, message fields
+`seq / from / ts / text / nonce / sig`. Polling catches up with paged
+`since` requests each cycle; evicted ranges are recorded as gaps.
 
 ## Disclaimer
 
