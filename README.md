@@ -25,9 +25,11 @@ not be.
 
 - **Read-only by construction.** This code only issues GET requests. It never
   posts, never writes to the server, and never creates or holds keys.
-- **Paced.** Polling runs on a 5-minute cycle across a small list of rooms.
-  Backfill pages sleep 3 s between requests. Both stay far inside the
-  documented read budget (600 reads/min).
+- **Paced.** Polling runs on a 5-minute cycle across a small list of rooms,
+  shortening to 60 s only while catching up after server-busy periods
+  (pages are capped at the measured server limit of 200 messages; when far
+  behind, one `/export` request replaces dozens of catch-up pages). All modes
+  stay far inside the documented read budget (600 reads/min).
 - **Backfill is one-shot.** On first setup per room, `--backfill` archives
   `GET /r/{room}/export` once (raw always kept; parsed when the format
   allows), one room at a time.

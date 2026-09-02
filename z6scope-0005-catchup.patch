@@ -1,0 +1,172 @@
+diff --git a/README.md b/README.md
+index 399601b..c7a2a98 100644
+--- a/README.md
++++ b/README.md
+@@ -25,9 +25,11 @@ not be.
+ 
+ - **Read-only by construction.** This code only issues GET requests. It never
+   posts, never writes to the server, and never creates or holds keys.
+-- **Paced.** Polling runs on a 5-minute cycle across a small list of rooms.
+-  Backfill pages sleep 3 s between requests. Both stay far inside the
+-  documented read budget (600 reads/min).
++- **Paced.** Polling runs on a 5-minute cycle across a small list of rooms,
++  shortening to 60 s only while catching up after server-busy periods
++  (pages are capped at the measured server limit of 200 messages; when far
++  behind, one `/export` request replaces dozens of catch-up pages). All modes
++  stay far inside the documented read budget (600 reads/min).
+ - **Backfill is one-shot.** On first setup per room, `--backfill` archives
+   `GET /r/{room}/export` once (raw always kept; parsed when the format
+   allows), one room at a time.
+diff --git a/collector.py b/collector.py
+index 5bf8fc9..37130da 100644
+--- a/collector.py
++++ b/collector.py
+@@ -51,11 +51,15 @@ CONFIG_PATH = ROOT / "rooms.json"       # observation points live in config,
+ DB_PATH = ROOT / "data" / "z6scope.sqlite3"
+ RAW_DIR = ROOT / "raw"
+ 
+-INTERVAL_SEC = 300          # polling cycle (5-min discipline)
+-PAGE_LIMIT = 100            # messages per request
+-MAX_PAGES_PER_CYCLE = 60    # safety cap per room per cycle (6,000 msgs);
+-                            # at ~300 msgs/min in /r/technocore a 5-min cycle
+-                            # needs ~16 pages, so 60 leaves headroom
++INTERVAL_SEC = 300          # normal polling cycle (5-min discipline)
++FAST_RETRY_SEC = 60         # shortened cycle while behind (busy/page-capped);
++                            # /r/technocore's ring turns over in ~77 min, so
++                            # debt must be repaid quickly or it is evicted
++PAGE_LIMIT = 200            # server caps a page at 200 (measured 2026-09-02:
++                            # limit=1000 and limit=5000 both returned count=200)
++MAX_PAGES_PER_CYCLE = 40    # safety cap per room per cycle (8,000 msgs)
++EXPORT_FALLBACK_LAG = 4000  # if we are further behind than this, one /export
++                            # (a single request) beats 20+ pages of catch-up
+ PAGE_SLEEP_SEC = 0.5        # pause between catch-up pages
+ POLL_SLEEP_BETWEEN_ROOMS = 2.0
+ HTTP_TIMEOUT = 20
+@@ -63,7 +67,7 @@ EXPORT_TIMEOUT = 90   # /export generates the whole ring server-side; be patient
+ RETRIES = 5
+ RETRY_SLEEP = 5.0
+ RETRY_MAX_WAIT = 60.0        # cap for a single backoff wait
+-BUSY_COOLDOWN_SEC = 45       # extra pause after giving up on a busy server
++BUSY_COOLDOWN_SEC = 15       # extra pause after giving up on a busy server
+ USER_AGENT = "z6scope-collector/0.2 (read-only archiver; github.com/shibainu-inu/z6scope)"
+ 
+ # --- FIELD MAPPING (verified against live /r/technocore, 2026-09-02) --------
+@@ -390,17 +394,43 @@ def poll_room(con: sqlite3.Connection, room: str) -> bool:
+                 record_gap(con, room, cursor + 1, r["min_seq"] - 1)
+         total_new += r["inserted"]
+         cursor = r["max_seq"]
++        if (r["last_seq"] > 0 and cursor is not None
++                and r["last_seq"] - cursor > EXPORT_FALLBACK_LAG):
++            log.info("[%s] %d behind — switching to export recovery",
++                     room, r["last_seq"] - cursor)
++            try:
++                cursor = recover_via_export(con, room, cursor)
++            except (RuntimeError, urllib.error.HTTPError) as e:
++                log.warning("[%s] export recovery failed (%s) — paging on", room, e)
++            break
+         if r["parsed"] < PAGE_LIMIT:
+             break  # caught up
+-        time.sleep(PAGE_SLEEP_SEC)
++        snooze(PAGE_SLEEP_SEC)
+     else:
+-        log.warning("[%s] page cap (%d) hit — will continue next cycle",
++        log.warning("[%s] page cap (%d) hit — fast retry next cycle",
+                     room, MAX_PAGES_PER_CYCLE)
++        busy = True
+     log.info("[%s] new=%d cursor=%s%s", room, total_new, cursor,
+-             " (busy)" if busy else "")
++             " (behind, fast retry)" if busy else "")
+     return busy
+ 
+ 
++def recover_via_export(con: sqlite3.Connection, room: str,
++                       cursor: int) -> int:
++    """One /export request instead of 20+ catch-up pages when far behind.
++    Returns the new cursor. Records a gap if the ring no longer reaches
++    back to cursor+1."""
++    fetched_at = int(time.time())
++    payload = http_get(export_url(room), timeout=EXPORT_TIMEOUT)
++    raw_file = save_raw(room, payload, fetched_at, kind="export")
++    r = ingest(con, room, payload, fetched_at, raw_file)
++    if r["parsed"] and r["min_seq"] > cursor + 1:
++        record_gap(con, room, cursor + 1, r["min_seq"] - 1)
++    log.info("[%s] export recovery: parsed=%d new=%d seq %d..%d",
++             room, r["parsed"], r["inserted"], r["min_seq"], r["max_seq"])
++    return max(cursor, r["max_seq"])
++
++
+ def backfill_room(con: sqlite3.Connection, room: str) -> None:
+     """One-shot archive of GET /r/{room}/export.
+ 
+@@ -448,6 +478,16 @@ def _sig_handler(_n, _f):
+     _stop = True
+ 
+ 
++def snooze(seconds: float) -> None:
++    """Sleep that reacts to SIGTERM/Ctrl+C within ~1 s."""
++    end = time.monotonic() + seconds
++    while not _stop:
++        left = end - time.monotonic()
++        if left <= 0:
++            return
++        time.sleep(min(1.0, left))
++
++
+ def main() -> None:
+     logging.basicConfig(level=logging.INFO,
+                         format="%(asctime)s %(levelname)s %(message)s")
+@@ -459,9 +499,8 @@ def main() -> None:
+     g.add_argument("--reparse", nargs=2, metavar=("ROOM", "RAWFILE"))
+     args = ap.parse_args()
+ 
+-    signal.signal(signal.SIGINT, _sig_handler)
+-    signal.signal(signal.SIGTERM, _sig_handler)
+-    con = open_db()
++    signal.signal(signal.SIGTERM, _sig_handler)   # SIGINT (Ctrl+C) stays
++    con = open_db()                               # default: instant stop
+ 
+     if args.backfill:
+         backfill_room(con, args.backfill)
+@@ -470,22 +509,27 @@ def main() -> None:
+         reparse_raw(con, args.reparse[0], args.reparse[1])
+         return
+ 
+-    while True:
+-        for room in load_rooms():  # reloaded every cycle: HTLC rooms can be
+-            if _stop:              # added to rooms.json without a restart
++    try:
++        while True:
++            any_behind = False
++            for room in load_rooms():  # reloaded every cycle: HTLC rooms can
++                if _stop:              # be added without a restart
++                    return
++                busy = False
++                try:
++                    busy = poll_room(con, room)
++                except Exception as e:  # noqa: BLE001 — keep the loop alive
++                    log.error("[%s] poll failed: %s", room, e)
++                    busy = True
++                if busy:
++                    any_behind = True
++                    snooze(BUSY_COOLDOWN_SEC)
++                snooze(POLL_SLEEP_BETWEEN_ROOMS)
++            if args.once or _stop:
+                 return
+-            busy = False
+-            try:
+-                busy = poll_room(con, room)
+-            except Exception as e:  # noqa: BLE001 — keep the loop alive
+-                log.error("[%s] poll failed: %s", room, e)
+-            if busy:
+-                log.info("cooling down %ds after busy signals", BUSY_COOLDOWN_SEC)
+-                time.sleep(BUSY_COOLDOWN_SEC)
+-            time.sleep(POLL_SLEEP_BETWEEN_ROOMS)
+-        if args.once or _stop:
+-            return
+-        time.sleep(INTERVAL_SEC)
++            snooze(FAST_RETRY_SEC if any_behind else INTERVAL_SEC)
++    except KeyboardInterrupt:
++        log.info("interrupted — cursor is durable, resuming is safe")
+ 
+ 
+ if __name__ == "__main__":
