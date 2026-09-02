@@ -1,0 +1,9 @@
+{
+  "_comment": "z6scope observation points. Add HTLC receipt rooms here once their location is confirmed — the collector reloads this file every cycle, no restart needed.",
+  "rooms": [
+    "technocore",
+    "inference-agents",
+    "credence",
+    "kibble"
+  ]
+}
