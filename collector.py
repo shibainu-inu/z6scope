@@ -58,6 +58,7 @@ MAX_PAGES_PER_CYCLE = 60    # safety cap per room per cycle (6,000 msgs);
 PAGE_SLEEP_SEC = 0.5        # pause between catch-up pages
 POLL_SLEEP_BETWEEN_ROOMS = 2.0
 HTTP_TIMEOUT = 20
+EXPORT_TIMEOUT = 90   # /export generates the whole ring server-side; be patient
 RETRIES = 3
 RETRY_SLEEP = 5.0
 USER_AGENT = "z6scope-collector/0.2 (read-only archiver; github.com/shibainu-inu/z6scope)"
@@ -152,12 +153,12 @@ def meta_set(con: sqlite3.Connection, key: str, value: str) -> None:
 # ----------------------------------------------------------------------------
 # fetch (GET only)
 # ----------------------------------------------------------------------------
-def http_get(url: str) -> bytes:
+def http_get(url: str, timeout: int = HTTP_TIMEOUT) -> bytes:
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
     last_err: Exception | None = None
     for attempt in range(1, RETRIES + 1):
         try:
-            with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
                 return resp.read()
         except urllib.error.HTTPError as e:
             last_err = e
@@ -207,8 +208,19 @@ def first_key(d: dict, keys: tuple) -> object:
 
 
 def extract(payload: bytes) -> tuple[dict, list[dict]]:
-    """Returns (top_level_doc, message_dicts)."""
-    doc = json.loads(payload)
+    """Returns (top_level_doc, message_dicts).
+
+    Handles both response shapes observed live (2026-09-02):
+      - room polling: one JSON object with a "messages" array
+      - /export: JSONL — one JSON object per line ("Extra data" on whole-body
+        parse is the signature of this format)
+    """
+    try:
+        doc = json.loads(payload)
+    except json.JSONDecodeError as e:
+        if "Extra data" not in str(e):
+            raise
+        return ({}, _extract_jsonl(payload))
     if isinstance(doc, list):
         return ({}, [m for m in doc if isinstance(m, dict)])
     if isinstance(doc, dict):
@@ -217,6 +229,36 @@ def extract(payload: bytes) -> tuple[dict, list[dict]]:
             if isinstance(v, list):
                 return (doc, [m for m in v if isinstance(m, dict)])
     raise ValueError("no message array found (adjust MESSAGES_KEY_CANDIDATES)")
+
+
+def _extract_jsonl(payload: bytes) -> list[dict]:
+    msgs: list[dict] = []
+    bad = 0
+    for line in payload.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            bad += 1
+            continue
+        if not isinstance(obj, dict):
+            continue
+        picked = False
+        for k in MESSAGES_KEY_CANDIDATES:
+            v = obj.get(k)
+            if isinstance(v, list):
+                msgs.extend(m for m in v if isinstance(m, dict))
+                picked = True
+                break
+        if not picked:
+            msgs.append(obj)   # the line itself is a message object
+    if bad:
+        log.warning("jsonl: %d unparseable lines skipped (raw retains them)", bad)
+    if not msgs:
+        raise ValueError("jsonl detected but no message objects found")
+    return msgs
 
 
 def normalize(msg: dict) -> dict | None:
@@ -344,7 +386,7 @@ def backfill_room(con: sqlite3.Connection, room: str) -> None:
     data is safe in raw/ and a parser can be added later.
     """
     fetched_at = int(time.time())
-    payload = http_get(export_url(room))
+    payload = http_get(export_url(room), timeout=EXPORT_TIMEOUT)
     raw_file = save_raw(room, payload, fetched_at, kind="export")
     log.info("[%s] export archived: %s (%d bytes)", room, raw_file, len(payload))
     r = ingest(con, room, payload, fetched_at, raw_file)
@@ -354,6 +396,17 @@ def backfill_room(con: sqlite3.Connection, room: str) -> None:
     else:
         log.warning("[%s] export not parsed as JSON messages — raw archived, "
                     "send the first bytes of %s for a parser patch", room, raw_file)
+
+
+def reparse_raw(con: sqlite3.Connection, room: str, raw_path: str) -> None:
+    """Ingest an already-archived raw file without touching the server."""
+    path = (ROOT / raw_path) if not Path(raw_path).is_absolute() else Path(raw_path)
+    with gzip.open(path, "rb") as f:
+        payload = f.read()
+    fetched_at = int(time.time())
+    r = ingest(con, room, payload, fetched_at, str(raw_path))
+    log.info("[%s] reparse %s: parsed=%d new=%d seq %d..%d",
+             room, path.name, r["parsed"], r["inserted"], r["min_seq"], r["max_seq"])
 
 
 def load_rooms() -> list[str]:
@@ -380,6 +433,7 @@ def main() -> None:
     g.add_argument("--once", action="store_true")
     g.add_argument("--loop", action="store_true")
     g.add_argument("--backfill", metavar="ROOM")
+    g.add_argument("--reparse", nargs=2, metavar=("ROOM", "RAWFILE"))
     args = ap.parse_args()
 
     signal.signal(signal.SIGINT, _sig_handler)
@@ -388,6 +442,9 @@ def main() -> None:
 
     if args.backfill:
         backfill_room(con, args.backfill)
+        return
+    if args.reparse:
+        reparse_raw(con, args.reparse[0], args.reparse[1])
         return
 
     while True:
