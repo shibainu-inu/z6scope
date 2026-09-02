@@ -31,6 +31,7 @@ import gzip
 import hashlib
 import json
 import logging
+import random
 import re
 import signal
 import sqlite3
@@ -59,8 +60,10 @@ PAGE_SLEEP_SEC = 0.5        # pause between catch-up pages
 POLL_SLEEP_BETWEEN_ROOMS = 2.0
 HTTP_TIMEOUT = 20
 EXPORT_TIMEOUT = 90   # /export generates the whole ring server-side; be patient
-RETRIES = 3
+RETRIES = 5
 RETRY_SLEEP = 5.0
+RETRY_MAX_WAIT = 60.0        # cap for a single backoff wait
+BUSY_COOLDOWN_SEC = 45       # extra pause after giving up on a busy server
 USER_AGENT = "z6scope-collector/0.2 (read-only archiver; github.com/shibainu-inu/z6scope)"
 
 # --- FIELD MAPPING (verified against live /r/technocore, 2026-09-02) --------
@@ -163,8 +166,15 @@ def http_get(url: str, timeout: int = HTTP_TIMEOUT) -> bytes:
         except urllib.error.HTTPError as e:
             last_err = e
             if e.code in (429, 503):
-                wait = RETRY_SLEEP * attempt
-                log.warning("HTTP %s on %s — backing off %.0fs", e.code, url, wait)
+                retry_after = 0.0
+                try:
+                    retry_after = float(e.headers.get("Retry-After", "0"))
+                except (TypeError, ValueError):
+                    pass
+                backoff = min(RETRY_SLEEP * (2 ** (attempt - 1)), RETRY_MAX_WAIT)
+                wait = max(retry_after, backoff) + random.uniform(0, 2)
+                log.warning("HTTP %s on %s — backing off %.1fs (attempt %d/%d)",
+                            e.code, url, wait, attempt, RETRIES)
                 time.sleep(wait)
                 continue
             raise
@@ -343,7 +353,7 @@ def stored_max_seq(con: sqlite3.Connection, room: str) -> int | None:
     return row[0]
 
 
-def poll_room(con: sqlite3.Connection, room: str) -> None:
+def poll_room(con: sqlite3.Connection, room: str) -> bool:
     """Catch up from our stored position using forward paging (`since`).
 
     Gap rule: when we ask for `since=cursor` and the server's oldest returned
@@ -352,9 +362,20 @@ def poll_room(con: sqlite3.Connection, room: str) -> None:
     """
     cursor = stored_max_seq(con, room)
     total_new = 0
+    busy = False
     for page in range(MAX_PAGES_PER_CYCLE):
         fetched_at = int(time.time())
-        payload = http_get(room_url(room, since=cursor))
+        try:
+            payload = http_get(room_url(room, since=cursor))
+        except (RuntimeError, urllib.error.HTTPError) as e:
+            # Politeness over completeness: stop pushing a stressed server.
+            # Nothing is lost yet — the cursor stays at the last stored seq
+            # and the next cycle resumes from it via `since`.
+            log.warning("[%s] server busy after retries (%s) — "
+                        "yielding, will resume next cycle from seq %s",
+                        room, e, cursor)
+            busy = True
+            break
         raw_file = save_raw(room, payload, fetched_at)
         r = ingest(con, room, payload, fetched_at, raw_file)
         if r["parsed"] == 0:
@@ -375,7 +396,9 @@ def poll_room(con: sqlite3.Connection, room: str) -> None:
     else:
         log.warning("[%s] page cap (%d) hit — will continue next cycle",
                     room, MAX_PAGES_PER_CYCLE)
-    log.info("[%s] new=%d cursor=%s", room, total_new, cursor)
+    log.info("[%s] new=%d cursor=%s%s", room, total_new, cursor,
+             " (busy)" if busy else "")
+    return busy
 
 
 def backfill_room(con: sqlite3.Connection, room: str) -> None:
@@ -451,10 +474,14 @@ def main() -> None:
         for room in load_rooms():  # reloaded every cycle: HTLC rooms can be
             if _stop:              # added to rooms.json without a restart
                 return
+            busy = False
             try:
-                poll_room(con, room)
+                busy = poll_room(con, room)
             except Exception as e:  # noqa: BLE001 — keep the loop alive
                 log.error("[%s] poll failed: %s", room, e)
+            if busy:
+                log.info("cooling down %ds after busy signals", BUSY_COOLDOWN_SEC)
+                time.sleep(BUSY_COOLDOWN_SEC)
             time.sleep(POLL_SLEEP_BETWEEN_ROOMS)
         if args.once or _stop:
             return
