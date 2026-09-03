@@ -58,12 +58,22 @@ FAST_RETRY_SEC = 60         # shortened cycle while behind (busy/page-capped);
 PAGE_LIMIT = 200            # server caps a page at 200 (measured 2026-09-02:
                             # limit=1000 and limit=5000 both returned count=200)
 MAX_PAGES_PER_CYCLE = 40    # safety cap per room per cycle (8,000 msgs)
-EXPORT_INTERVAL_SEC = 3600  # periodic /export per room — the ONLY complete
-                            # source (see the `since` note in poll_room).
-                            # Must stay well under the ring's lifetime:
-                            # /r/technocore holds ~26,500 msgs at ~220/min
-                            # (~2 h), so 1 h leaves a full safety margin at a
-                            # cost of one request per room per hour.
+EXPORT_INTERVAL_SEC = 3600  # UPPER bound for the per-room /export interval —
+                            # the ONLY complete source (see poll_room). Rings
+                            # are byte-capped (~10 MiB), so their lifetime
+                            # swings with rate: 1–3 h on 2026-09-02, but only
+                            # 34–65 min for technocore/kibble on the evening
+                            # of 2026-09-03, when a fixed hour lost ~19k seqs.
+EXPORT_MIN_SEC = 600        # lower bound — politeness floor even for a room
+                            # whose ring turns over in minutes
+EXPORT_LIFETIME_FRACTION = 0.5  # interval = ring lifetime × this. The timer
+                            # is checked once per cycle per room, so real
+                            # spacing = interval + cycle drift (INTERVAL_SEC
+                            # plus that cycle's work, up to a few minutes).
+                            # Halving leaves ~1.5× headroom for a further
+                            # rate rise at a 34-min ring; once the 600 s
+                            # floor binds (lifetime < ~13 min with drift)
+                            # loss resumes and is recorded honestly.
 PAGE_SLEEP_SEC = 0.5        # pause between catch-up pages
 POLL_SLEEP_BETWEEN_ROOMS = 2.0
 HTTP_TIMEOUT = 20
@@ -411,7 +421,7 @@ def poll_room(con: sqlite3.Connection, room: str) -> bool:
                          room, r["min_seq"])
             elif r["min_seq"] > cursor + 1:
                 # Expected on busy rooms: the server handed us the head window,
-                # not the page after the cursor. Not a gap — the hourly export
+                # not the page after the cursor. Not a gap — the periodic export
                 # fills it; only export-confirmed losses are recorded.
                 log.info("[%s] head window starts at %d (%d seqs behind cursor; "
                          "export fills)", room, r["min_seq"],
@@ -458,6 +468,30 @@ def record_losses_below(con: sqlite3.Connection, room: str, ring_min: int) -> No
         record_gap(con, room, expected, ring_min - 1)
 
 
+def adapt_export_interval(con: sqlite3.Connection, room: str,
+                          min_seq: int, max_seq: int) -> None:
+    """Set the room's export interval to a fraction of the ring's observed
+    lifetime (max ts − min ts of what the export returned), clamped to
+    [EXPORT_MIN_SEC, EXPORT_INTERVAL_SEC]. SQLite parses the server's
+    `…Z` timestamps; Python 3.10's fromisoformat does not. A ring whose span
+    cannot be measured (bad ts, single message) keeps the previous value."""
+    row = con.execute(
+        # MAX/MIN over julianday(), not over the TEXT: aggregates skip NULLs, so
+        # one unparseable ts is ignored instead of poisoning the whole span.
+        "SELECT (MAX(julianday(ts)) - MIN(julianday(ts))) * 86400 FROM messages"
+        " WHERE room=? AND seq BETWEEN ? AND ?", (room, min_seq, max_seq)).fetchone()
+    if row is None or row[0] is None or row[0] <= 0:
+        log.warning("[%s] ring lifetime not measurable (ts unparseable or single "
+                    "message) — export interval unchanged", room)
+        return
+    lifetime = float(row[0])
+    interval = int(min(EXPORT_INTERVAL_SEC,
+                       max(EXPORT_MIN_SEC, lifetime * EXPORT_LIFETIME_FRACTION)))
+    meta_set(con, f"export_interval:{room}", str(interval))
+    log.info("[%s] ring lifetime %.0fm (%ds) → next export in %dm (%ds)",
+             room, lifetime / 60, int(lifetime), interval // 60, interval)
+
+
 def recover_via_export(con: sqlite3.Connection, room: str) -> dict:
     """Fetch the whole surviving ring via /export and ingest it.
 
@@ -473,13 +507,15 @@ def recover_via_export(con: sqlite3.Connection, room: str) -> dict:
         meta_set(con, f"last_export_max:{room}", str(r["max_seq"]))
         log.info("[%s] export: parsed=%d new=%d seq %d..%d",
                  room, r["parsed"], r["inserted"], r["min_seq"], r["max_seq"])
+        adapt_export_interval(con, room, r["min_seq"], r["max_seq"])
     else:
         log.warning("[%s] export not parsed — raw archived at %s", room, raw_file)
     return r
 
 
 def maybe_periodic_export(con: sqlite3.Connection, room: str) -> None:
-    """One /export per room per EXPORT_INTERVAL_SEC.
+    """One /export per room per its adaptive interval (see
+    adapt_export_interval; EXPORT_INTERVAL_SEC until the first export).
 
     This is what actually makes coverage complete: head polling alone loses
     everything beyond the newest page between cycles, because `since` cannot
@@ -488,7 +524,8 @@ def maybe_periodic_export(con: sqlite3.Connection, room: str) -> None:
     parsing either way, so a crash here never loses data.
     """
     last = meta_get(con, f"last_export:{room}")
-    if last is not None and time.time() - float(last) < EXPORT_INTERVAL_SEC:
+    interval = float(meta_get(con, f"export_interval:{room}") or EXPORT_INTERVAL_SEC)
+    if last is not None and time.time() - float(last) < interval:
         return
     try:
         r = recover_via_export(con, room)
