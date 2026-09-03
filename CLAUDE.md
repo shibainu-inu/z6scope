@@ -63,14 +63,20 @@ Healthy = counts growing, new gaps small or absent, no fresh parse failures.
 ## Server facts (measured 2026-09-02 — re-verify before relying on them)
 
 - Page cap: **200 messages/request** regardless of `limit`
-- Forward paging only (`since`); no backward paging; `/r/{room}/export`
-  returns the whole surviving ring as **JSONL**
-- `/r/technocore`: ~300 msgs/min; ring (~10 MiB) turns over in ~77 min —
-  the collector must never fall more than ~1 h behind or data is lost
+- **`since` does not page backward** (2026-09-03): the 200 cap is applied
+  from the newest end, so `since=<newest-5000>` returns the newest 200.
+  Polling only tracks the head; `/r/{room}/export` (whole surviving ring,
+  **JSONL**, contiguous) is the only complete source and runs hourly
+  (`EXPORT_INTERVAL_SEC`). A manual `--backfill` counts as an export.
+- `/r/technocore`: ~150–220 msgs/min; ring is ~10 MiB, i.e. 14k–30k
+  messages depending on body length (~1–3 h) — the hourly export must keep
+  running or data is lost for good
 - 503 bursts are a known server condition (see flop-labs/technocore-chat
-  issue #588); the collector retreats politely and catches up via
-  fast-retry cycles and `/export` recovery
-- Message fields: `seq, ts, from, text, nonce, sig`
+  issue #588); the collector retreats politely; exports use a single
+  attempt and retry next cycle
+- Message fields: `seq, ts, from, text, nonce, sig` — **no reply field**
+- `coverage_gaps` records only export-confirmed permanent losses since
+  2026-09-03; earlier rows over-record (see `docs/findings-2026-09-03.md`)
 
 ## Style
 
