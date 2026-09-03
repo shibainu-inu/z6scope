@@ -58,8 +58,12 @@ FAST_RETRY_SEC = 60         # shortened cycle while behind (busy/page-capped);
 PAGE_LIMIT = 200            # server caps a page at 200 (measured 2026-09-02:
                             # limit=1000 and limit=5000 both returned count=200)
 MAX_PAGES_PER_CYCLE = 40    # safety cap per room per cycle (8,000 msgs)
-EXPORT_FALLBACK_LAG = 4000  # if we are further behind than this, one /export
-                            # (a single request) beats 20+ pages of catch-up
+EXPORT_INTERVAL_SEC = 3600  # periodic /export per room — the ONLY complete
+                            # source (see the `since` note in poll_room).
+                            # Must stay well under the ring's lifetime:
+                            # /r/technocore holds ~26,500 msgs at ~220/min
+                            # (~2 h), so 1 h leaves a full safety margin at a
+                            # cost of one request per room per hour.
 PAGE_SLEEP_SEC = 0.5        # pause between catch-up pages
 POLL_SLEEP_BETWEEN_ROOMS = 2.0
 HTTP_TIMEOUT = 20
@@ -160,10 +164,13 @@ def meta_set(con: sqlite3.Connection, key: str, value: str) -> None:
 # ----------------------------------------------------------------------------
 # fetch (GET only)
 # ----------------------------------------------------------------------------
-def http_get(url: str, timeout: int = HTTP_TIMEOUT) -> bytes:
+def http_get(url: str, timeout: int = HTTP_TIMEOUT,
+             retries: int = RETRIES) -> bytes:
+    """GET with polite backoff. `retries=1` is for the slow /export path so a
+    stalled export cannot block the whole cycle for ~8 min (5 × 90 s)."""
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
     last_err: Exception | None = None
-    for attempt in range(1, RETRIES + 1):
+    for attempt in range(1, retries + 1):
         try:
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 return resp.read()
@@ -178,13 +185,13 @@ def http_get(url: str, timeout: int = HTTP_TIMEOUT) -> bytes:
                 backoff = min(RETRY_SLEEP * (2 ** (attempt - 1)), RETRY_MAX_WAIT)
                 wait = max(retry_after, backoff) + random.uniform(0, 2)
                 log.warning("HTTP %s on %s — backing off %.1fs (attempt %d/%d)",
-                            e.code, url, wait, attempt, RETRIES)
+                            e.code, url, wait, attempt, retries)
                 time.sleep(wait)
                 continue
             raise
         except (urllib.error.URLError, TimeoutError) as e:
             last_err = e
-            log.warning("network error on %s (attempt %d/%d): %s", url, attempt, RETRIES, e)
+            log.warning("network error on %s (attempt %d/%d): %s", url, attempt, retries, e)
             time.sleep(RETRY_SLEEP)
     raise RuntimeError(f"giving up on {url}: {last_err}")
 
@@ -345,7 +352,10 @@ def record_gap(con: sqlite3.Connection, room: str, start: int, end: int) -> None
         "INSERT OR IGNORE INTO coverage_gaps(room, gap_start, gap_end, detected_at)"
         " VALUES (?,?,?,?)", (room, start, end, int(time.time())))
     con.commit()
-    log.warning("[%s] coverage gap recorded: seq %d..%d (evicted before read)",
+    # Only /export calls this: a range the ring no longer holds is gone for
+    # good. Ranges that polling merely skips are not gaps (see poll_room).
+    log.warning("[%s] coverage gap recorded: seq %d..%d "
+                "(not in ring at export time — permanently lost)",
                 room, start, end)
 
 
@@ -358,12 +368,21 @@ def stored_max_seq(con: sqlite3.Connection, room: str) -> int | None:
 
 
 def poll_room(con: sqlite3.Connection, room: str) -> bool:
-    """Catch up from our stored position using forward paging (`since`).
+    """Poll the head of the room, plus a periodic /export for completeness.
 
-    Gap rule: when we ask for `since=cursor` and the server's oldest returned
-    seq is > cursor+1 on the FIRST page, the range in between was evicted
-    before we could read it — recorded as a coverage gap.
+    `since` does NOT page backward (measured 2026-09-02): the 200-message cap
+    is applied from the NEWEST end, so `since=<newest-5000>` returns the newest
+    200 — not the 200 following the cursor. Polling therefore only keeps up
+    while we are within one page of the head; anything further back is skipped
+    by the server, not evicted from the ring. /export (the whole surviving
+    ring, JSONL, contiguous) is the only complete source, so it runs on a timer
+    rather than on a lag estimate.
+
+    Gap rule: when the first page's oldest seq is > cursor+1, that range was
+    not read in this cycle and is recorded as a coverage gap. A later /export
+    usually fills it; the record is kept regardless (rule 5).
     """
+    maybe_periodic_export(con, room)
     cursor = stored_max_seq(con, room)
     total_new = 0
     busy = False
@@ -391,20 +410,16 @@ def poll_room(con: sqlite3.Connection, room: str) -> bool:
                          "(older history is unreachable via polling; use --backfill)",
                          room, r["min_seq"])
             elif r["min_seq"] > cursor + 1:
-                record_gap(con, room, cursor + 1, r["min_seq"] - 1)
+                # Expected on busy rooms: the server handed us the head window,
+                # not the page after the cursor. Not a gap — the hourly export
+                # fills it; only export-confirmed losses are recorded.
+                log.info("[%s] head window starts at %d (%d seqs behind cursor; "
+                         "export fills)", room, r["min_seq"],
+                         r["min_seq"] - cursor - 1)
         total_new += r["inserted"]
         cursor = r["max_seq"]
-        if (r["last_seq"] > 0 and cursor is not None
-                and r["last_seq"] - cursor > EXPORT_FALLBACK_LAG):
-            log.info("[%s] %d behind — switching to export recovery",
-                     room, r["last_seq"] - cursor)
-            try:
-                cursor = recover_via_export(con, room, cursor)
-            except (RuntimeError, urllib.error.HTTPError) as e:
-                log.warning("[%s] export recovery failed (%s) — paging on", room, e)
-            break
         if r["parsed"] < PAGE_LIMIT:
-            break  # caught up
+            break  # caught up with the head window
         snooze(PAGE_SLEEP_SEC)
     else:
         log.warning("[%s] page cap (%d) hit — fast retry next cycle",
@@ -415,40 +430,82 @@ def poll_room(con: sqlite3.Connection, room: str) -> bool:
     return busy
 
 
-def recover_via_export(con: sqlite3.Connection, room: str,
-                       cursor: int) -> int:
-    """One /export request instead of 20+ catch-up pages when far behind.
-    Returns the new cursor. Records a gap if the ring no longer reaches
-    back to cursor+1."""
+def record_losses_below(con: sqlite3.Connection, room: str, ring_min: int) -> None:
+    """Every seq below the ring's oldest that we do not hold is gone for good.
+
+    Scans [floor, ring_min-1] for holes, where floor is the previous export's
+    max (everything below it was already judged) or, on the first export under
+    this regime, our oldest stored seq. Head polling cannot be used as the
+    reference because it keeps the cursor at the head regardless of holes.
+    """
+    prev = meta_get(con, f"last_export_max:{room}")
+    if prev is not None:
+        floor = int(prev) + 1
+    else:
+        row = con.execute("SELECT MIN(seq) FROM messages WHERE room=?", (room,)).fetchone()
+        if row[0] is None:
+            return
+        floor = row[0]
+    if floor > ring_min - 1:
+        return
+    expected = floor
+    for (s,) in con.execute("SELECT seq FROM messages WHERE room=? AND seq BETWEEN ? AND ?"
+                            " ORDER BY seq", (room, floor, ring_min - 1)):
+        if s > expected:
+            record_gap(con, room, expected, s - 1)
+        expected = s + 1
+    if expected <= ring_min - 1:
+        record_gap(con, room, expected, ring_min - 1)
+
+
+def recover_via_export(con: sqlite3.Connection, room: str) -> dict:
+    """Fetch the whole surviving ring via /export and ingest it.
+
+    Raw body is archived before parsing. On success, holes below the ring's
+    oldest seq are recorded as permanent losses and the scan floor advances.
+    """
     fetched_at = int(time.time())
-    payload = http_get(export_url(room), timeout=EXPORT_TIMEOUT)
+    payload = http_get(export_url(room), timeout=EXPORT_TIMEOUT, retries=1)
     raw_file = save_raw(room, payload, fetched_at, kind="export")
     r = ingest(con, room, payload, fetched_at, raw_file)
-    if r["parsed"] and r["min_seq"] > cursor + 1:
-        record_gap(con, room, cursor + 1, r["min_seq"] - 1)
-    log.info("[%s] export recovery: parsed=%d new=%d seq %d..%d",
-             room, r["parsed"], r["inserted"], r["min_seq"], r["max_seq"])
-    return max(cursor, r["max_seq"])
+    if r["parsed"]:
+        record_losses_below(con, room, r["min_seq"])
+        meta_set(con, f"last_export_max:{room}", str(r["max_seq"]))
+        log.info("[%s] export: parsed=%d new=%d seq %d..%d",
+                 room, r["parsed"], r["inserted"], r["min_seq"], r["max_seq"])
+    else:
+        log.warning("[%s] export not parsed — raw archived at %s", room, raw_file)
+    return r
+
+
+def maybe_periodic_export(con: sqlite3.Connection, room: str) -> None:
+    """One /export per room per EXPORT_INTERVAL_SEC.
+
+    This is what actually makes coverage complete: head polling alone loses
+    everything beyond the newest page between cycles, because `since` cannot
+    page backward. The timer is advanced only on success, so a failed or
+    timed-out export is retried next cycle; the raw body is archived before
+    parsing either way, so a crash here never loses data.
+    """
+    last = meta_get(con, f"last_export:{room}")
+    if last is not None and time.time() - float(last) < EXPORT_INTERVAL_SEC:
+        return
+    try:
+        r = recover_via_export(con, room)
+    except (RuntimeError, urllib.error.HTTPError, OSError, ValueError) as e:
+        log.warning("[%s] periodic export failed (%s) — retrying next cycle",
+                    room, e)
+        return
+    if r["parsed"]:
+        meta_set(con, f"last_export:{room}", str(int(time.time())))
 
 
 def backfill_room(con: sqlite3.Connection, room: str) -> None:
-    """One-shot archive of GET /r/{room}/export.
-
-    The export format has not been observed yet: the raw body is always
-    archived first; JSON parsing is attempted on top. If parsing fails the
-    data is safe in raw/ and a parser can be added later.
-    """
-    fetched_at = int(time.time())
-    payload = http_get(export_url(room), timeout=EXPORT_TIMEOUT)
-    raw_file = save_raw(room, payload, fetched_at, kind="export")
-    log.info("[%s] export archived: %s (%d bytes)", room, raw_file, len(payload))
-    r = ingest(con, room, payload, fetched_at, raw_file)
+    """One-shot /export, same path as the periodic one so the loss scan and
+    the export timer stay consistent (a manual backfill counts as an export)."""
+    r = recover_via_export(con, room)
     if r["parsed"]:
-        log.info("[%s] export parsed: %d messages, %d new, seq %d..%d",
-                 room, r["parsed"], r["inserted"], r["min_seq"], r["max_seq"])
-    else:
-        log.warning("[%s] export not parsed as JSON messages — raw archived, "
-                    "send the first bytes of %s for a parser patch", room, raw_file)
+        meta_set(con, f"last_export:{room}", str(int(time.time())))
 
 
 def reparse_raw(con: sqlite3.Connection, room: str, raw_path: str) -> None:
