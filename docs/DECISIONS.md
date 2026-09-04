@@ -3,6 +3,19 @@
 決めたことだけを書く。未決は `docs/TODO.md` にある。
 形式: 日付 — 決定 — 理由 — 根拠（commit / 会話）。
 
+## 2026-09-04
+
+- **公開用カバレッジの境界 = `meta.last_export_max:{room}`、根拠は `messages` の実在 seq**
+  — `coverage_gaps` は旧体制で過大、かつ一部の喪失を記録していない（technocore 799、
+  kibble 44 seq）ため、公開数値の根拠にしない。境界以下で欠けている seq を恒久喪失、
+  境界より上の欠けを未確定（上限）とする。前提は「export は連続したリングを返し、
+  seq は連番」（09-02/03 実測、公開文にも前提を明記する）。再現可能列は境界以下に
+  限定した `present_at_boundary` / `span_at_boundary`。
+  — `docs/coverage.sql`、`docs/coverage_check.py`、`docs/coverage-2026-09-04.md`。
+  オーナー承認（Now #2 の Plan）、reviewer の指摘を全件適用。
+- **`coverage_gaps` の旧体制記録は重複していない**（cursor 単調 + PK）。findings-2026-09-03
+  §2.3 の「重複している」を訂正。併合クエリは no-op と検証済み。
+
 ## 2026-09-03（夕方）
 
 - **export 間隔はルームごとに「リング寿命 × 0.5」に自動追従、範囲 [600, 3600] 秒**

@@ -22,15 +22,46 @@
      つなぎの手動 backfill を 20:03–20:04 に 1 回ずつ実行（喪失なし）。
    - **24 時間の判定は、自動追従版の再起動時刻から数え直す**（固定 1 時間版の
      検証は「寿命 > 1 時間なら成立、そうでなければ喪失を正しく記録する」までで完了）。
-   - チェック 2（09-04 朝）、チェック 3（再起動 +24 時間）: 未実施
+   - 20:26:48 JST: 適応間隔版（commit `442e27e`、reviewer APPROVE・指摘適用済み）で再起動。
+     **24 時間の起点 = 09-03 20:26:48 JST**（判定は 09-04 20:27 JST）。
+   - 20:46–20:47 JST: つなぎ `--backfill`（承認済み）を新コードで実行。kibble +8,766
+     （寿命 66 分 → 間隔 1973 秒）、technocore +15,470（寿命 58 分 → 1752 秒）。
+     喪失なし。inference-agents / credence は 20:27 の自動 export で上限 3600 秒。
+     再起動以降の `coverage_gaps` 新規行 0（20:47 JST 時点）。
+   - 09-04 02:40:42 JST: **適応版で初の喪失 29 seq**（kibble 943184..943212、記録済み）。
+     01:43 の export で寿命 103 分 → 間隔 51 分、実行は 57 分後。その間にリングが
+     23,405 件 → 14,345 件（寿命 57 分）に縮小（本文長の増加、バイト上限）。
+     寿命が 1 間隔のうちに半分以下になると 0.5 の余裕では足りない実例。
+     チェック 2 でオーナー判断: **係数は据え置き**、チェック 3（24 時間）まで観察してから
+     再検討（候補: 0.5 → 0.4、または直近 2 回の寿命の最小値 × 0.5）。
+   - チェック 2（09-04 08:01 JST、再起動 +11.6 時間）: **合格**
+     - export 54 回（credence 12 / inference-agents 12 / kibble 13 / technocore 17）、
+       連続 export の最大間隔 60.2–66.0 分 = 間隔上限 60 分 + サイクル遅れ ≤ 6 分
+     - `coverage_gaps WHERE detected_at >= 1788434808` → 1 行（kibble 29 seq、02:40:42、export 時刻）
+     - `parse_failures` 新規 0
+     - 03:35–03:42 technocore: export タイムアウト 1 回 + head poll busy 2 回 → 次サイクルで回復、喪失なし
+     - 件数: credence 3,364 / inference-agents 65,368 / kibble 271,517 / technocore 451,989
+     - 間隔: technocore 2697 秒、他 3 ルーム 3600 秒（上限）
+   - チェック 3（09-04 20:27 JST）: 未実施
    - 完了条件:
-     - 09-03 16:45 JST から 24 時間、4 ルームすべてに 1 時間ごとの `export:`
-       ログがある（欠けがあれば理由と時刻を記録）
-     - `SELECT * FROM coverage_gaps WHERE detected_at >= 1788421510` の行が
-       export 時刻にしか無い
+     - 09-03 20:26:48 JST から 24 時間、4 ルームすべてに各自の `export_interval`
+       （+1 サイクル）以内の `export:` ログがある（欠けがあれば理由と時刻を記録）
+     - `SELECT * FROM coverage_gaps WHERE detected_at >= 1788434808` の行が
+       export 時刻にしか無い（1788434808 = 20:26:48 JST）
      - `parse_failures` に新規行が無い
      - 健全性 SQL の結果を日時つきでこの項目の Done に転記
 2. **公開用カバレッジ再計算 SQL の確定**
+   - 状態（09-04 09:50 JST）: `docs/coverage.sql`（A/B0/B/B2/C）、`docs/coverage_check.py`
+     （独立導出 + selftest）、`docs/coverage-2026-09-04.md` を作成。境界 = `meta.last_export_max`。
+     reviewer 1 回目 REQUEST_CHANGES → MUST/SHOULD/NIT 全件適用（恒等式は証拠でないと明記、
+     失敗しうる sanity 列、併合 no-op の検証、体制横断 union、公開文に前提、raw 残余の注記、
+     LEFT JOIN、-readonly、findings §2.3 訂正、DECISIONS 追記）。reviewer 2 回目 APPROVE、
+     SHOULD 2 件 + NIT 3 件も適用（sanity_dup_seqs 削除、`--raw-residual` 追加 → 0 / 0、
+     pinned モードの明示、ルーム集合の突き合わせ、`-- (A)` アンカー、§2.3 の文言）。
+     10:47 に境界が進んだ状態でも lost 不変。コミット済み（オーナー承認）。
+     残る完了条件: 「別々のセッションで 2 回」→ 次セッションで
+     `python3 docs/coverage_check.py credence=3386 inference-agents=205064 kibble=1012034 technocore=3969922`
+     を実行し、coverage-2026-09-04.md の表と一致することを記録する。
    - 完了条件:
      - ルームごとに「保有件数 / 恒久喪失（旧体制の重複範囲を併合、かつ実際に
        無い seq のみ）/ 不明」を出す SQL が `docs/` にある
