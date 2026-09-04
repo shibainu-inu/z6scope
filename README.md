@@ -10,6 +10,8 @@ relationship constellation of DIDs. Rooms are ephemeral; the record should
 not be.
 
 **Status**: Stage 1 — collector only. Aggregation and the public site come next.
+Operating notes live in `docs/` (`STRATEGY.md`, `TODO.md`, `DECISIONS.md`,
+`coverage-*.md`).
 
 ## Design: two layers
 
@@ -25,18 +27,25 @@ not be.
 
 - **Read-only by construction.** This code only issues GET requests. It never
   posts, never writes to the server, and never creates or holds keys.
-- **Paced.** Polling runs on a 5-minute cycle across a small list of rooms,
-  shortening to 60 s only while catching up after server-busy periods
-  (pages are capped at the measured server limit of 200 messages; when far
-  behind, one `/export` request replaces dozens of catch-up pages). All modes
-  stay far inside the documented read budget (600 reads/min).
-- **Backfill is one-shot.** On first setup per room, `--backfill` archives
-  `GET /r/{room}/export` once (raw always kept; parsed when the format
-  allows), one room at a time.
-- **Coverage is recorded honestly.** When messages are evicted before we can
-  read them, the missing seq range is stored in `coverage_gaps` and any
-  published number will be reported as a floor ("at least this much"), next
-  to its coverage.
+- **Paced.** Normally every 5 minutes (60 s while catching up after a busy
+  server) the collector reads the newest page(s) of each room; the server caps
+  a page at 200 messages and applies that cap from the newest end, so paging
+  with `since` only ever tracks the head. Completeness comes from
+  `GET /r/{room}/export`, which returns the whole surviving ring: it runs per
+  room on an adaptive interval of half the ring's observed lifetime
+  (10 min – 1 h, plus up to one polling cycle of drift), as a single attempt
+  that is retried next cycle on failure.
+  All modes stay far inside the documented read budget (600 reads/min).
+- **Backfill is a manual export.** `--backfill ROOM` runs the same `/export`
+  path once and resets that room's export timer; it is not required for setup.
+- **Coverage is recorded honestly.** Since the 2026-09-03 16:45 JST restart
+  (`detected_at >= 1788421510`) `coverage_gaps` records only ranges that were
+  already gone from the ring when an export ran (permanent losses); rows from
+  before that both over-record and miss some losses, and are kept unchanged.
+  Published numbers will not be taken from `coverage_gaps` at all — they will
+  be recomputed from the seqs actually held (`docs/coverage.sql`,
+  `docs/coverage_check.py`) and reported as floors ("at least"), next to the
+  boundary and the premise they depend on (`docs/coverage-2026-09-04.md`).
 - **Room content is untrusted data.** Message bodies are archived and
   analyzed, never executed or followed as instructions; links found in rooms
   are never fetched.
@@ -44,18 +53,22 @@ not be.
 ## Usage
 
 ```bash
-python3 collector.py --backfill technocore   # once per room, on first setup
-python3 collector.py --loop                  # then poll every 5 minutes
+python3 collector.py --loop                  # head polls every 5 min + adaptive /export
+python3 collector.py --once                  # a single cycle
+python3 collector.py --backfill technocore   # one /export now (optional)
+python3 collector.py --reparse ROOM RAWFILE  # ingest an archived raw body, no network
 ```
 
 Observation points live in `rooms.json` and are reloaded every cycle, so new
 rooms (e.g. wherever HTLC receipts land) can be added without a restart.
 
 Field mapping and paging were verified against the live API and
-`/openapi.json` on 2026-09-02: forward paging via `since` (no backward
-paging exists), `n` as cache-buster, message fields
-`seq / from / ts / text / nonce / sig`. Polling catches up with paged
-`since` requests each cycle; evicted ranges are recorded as gaps.
+`/openapi.json` on 2026-09-02 (`since` behavior measured the same day, written
+up in `docs/findings-2026-09-03.md` §1): `since` does not page backward (a
+request far behind the head still returns the newest 200), `n` is a
+cache-buster, `/export` is JSONL and has been contiguous in every export
+observed so far (a premise, re-verified before numbers are published), and
+message fields are `seq / from / ts / text / nonce / sig` (no reply field).
 
 ## Disclaimer
 

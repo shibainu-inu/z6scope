@@ -67,14 +67,12 @@
        無い seq のみ）/ 不明」を出す SQL が `docs/` にある
      - 別々のセッションで 2 回実行して同じ値（ルール 7）
      - 「少なくとも」の読み方が SQL のコメントに書いてある
-3. **README を実態に合わせる**
-   - 現状の不一致: 「forward paging via `since`」「far behind のとき export」
-     「evicted ranges を gap として記録」の 3 点（2026-09-03 時点で誤り）
-   - 完了条件: 上記 3 点が `collector.py` と `docs/DECISIONS.md` に一致し、
-     新しい主張を足していない
 
 ## Next
 
+- `collector.py` 冒頭のモジュール docstring（12–15 行目）が今も「forward paging only /
+  `since` returns messages with a GREATER seq」と述べている。README で直した誤りと同じ。
+  コード変更は別プランで（reviewer 指摘、09-04）
 - Stage 2 の指標を決める（**未決**）。候補は `docs/findings-2026-09-03.md` §4:
   テンプレ/非テンプレ比率と推移、テンプレ伝播波形、新規 DID 流入率、
   ルーム間橋渡し数、ルーム別本文長・ユニーク率
@@ -95,6 +93,11 @@
 
 ## Done
 
+- 2026-09-04 — README を実態に合わせた（Paced / Backfill / Coverage / Usage / paging の
+  5 箇所 + docs/ への案内）。reviewer REQUEST_CHANGES → MUST 2 / SHOULD 3 / NIT 3 を全件適用
+  （体制境界 16:45 JST の明記、旧体制は過大かつ一部未記録、60 s 高速リトライの復元、
+  since の実測日 09-02、contiguous は前提、将来形）。新しい主張なし
+- 2026-09-04 — Now #2 公開用カバレッジ再計算（commit `c2df514`）。残: 別セッションでの再実行
 - 2026-09-03 — hourly `/export` を完全性の唯一のソースに変更、`coverage_gaps` を
   export 確認済み恒久喪失のみに変更、`http_get(retries=)`（commit `3803a2d`）。
   オフラインテスト 12 ケース合格、`--once` 実サーバ 1 回成功
