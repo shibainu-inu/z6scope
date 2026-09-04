@@ -66,6 +66,8 @@ EXPORT_INTERVAL_SEC = 3600  # UPPER bound for the per-room /export interval —
                             # of 2026-09-03, when a fixed hour lost ~19k seqs.
 EXPORT_MIN_SEC = 600        # lower bound — politeness floor even for a room
                             # whose ring turns over in minutes
+EXPORT_LIFETIME_TRIM = 0.01     # drop this fraction of ts at each end before
+                            # measuring the ring lifetime (outlier guard)
 EXPORT_LIFETIME_FRACTION = 0.5  # interval = ring lifetime × this. The timer
                             # is checked once per cycle per room, so real
                             # spacing = interval + cycle drift (INTERVAL_SEC
@@ -471,24 +473,43 @@ def record_losses_below(con: sqlite3.Connection, room: str, ring_min: int) -> No
 def adapt_export_interval(con: sqlite3.Connection, room: str,
                           min_seq: int, max_seq: int) -> None:
     """Set the room's export interval to a fraction of the ring's observed
-    lifetime (max ts − min ts of what the export returned), clamped to
-    [EXPORT_MIN_SEC, EXPORT_INTERVAL_SEC]. SQLite parses the server's
+    lifetime (1%–99% trimmed ts span of what the export returned), clamped
+    to [EXPORT_MIN_SEC, EXPORT_INTERVAL_SEC]. SQLite parses the server's
     `…Z` timestamps; Python 3.10's fromisoformat does not. A ring whose span
     cannot be measured (bad ts, single message) keeps the previous value."""
-    row = con.execute(
-        # MAX/MIN over julianday(), not over the TEXT: aggregates skip NULLs, so
-        # one unparseable ts is ignored instead of poisoning the whole span.
-        "SELECT (MAX(julianday(ts)) - MIN(julianday(ts))) * 86400 FROM messages"
-        " WHERE room=? AND seq BETWEEN ? AND ?", (room, min_seq, max_seq)).fetchone()
-    if row is None or row[0] is None or row[0] <= 0:
-        log.warning("[%s] ring lifetime not measurable (ts unparseable or single "
-                    "message) — export interval unchanged", room)
+    # Trimmed span, not MAX-MIN: on 2026-09-04 a single message whose ts was
+    # 4.5 h older than its neighbours inflated a 43-min ring to "315 min", the
+    # interval jumped to the 1 h cap and 7,146 seqs were lost. ts is not
+    # strictly monotonic in seq either. Dropping the lowest and highest 1%
+    # (k rows each side; k = 0 below 100 rows) makes a handful of outliers
+    # irrelevant. Limits, deliberately accepted: more than 1% of rows skewed
+    # in one direction still inflates the span → cap → loss, and the only
+    # signal is this function's log line; the guard is weakest on small rings
+    # (k = 0 below 100 rows), which sit at the cap anyway. Trimming can only
+    # shorten the span, never lengthen it. julianday() returns NULL for
+    # unparseable ts; those rows are excluded before ranking. ORDER BY ts
+    # ranks TEXT, which is chronological because the server's ts is
+    # fixed-width `…THH:MM:SS.ffffffZ` (verified over all rows 2026-09-04);
+    # a stray other format could only shorten the span (both endpoints are
+    # members of the set), never inflate it.
+    n = con.execute("SELECT COUNT(*) FROM messages WHERE room=? AND seq BETWEEN ? AND ?"
+                    " AND julianday(ts) IS NOT NULL", (room, min_seq, max_seq)).fetchone()[0]
+    k = int(n * EXPORT_LIFETIME_TRIM)
+    q = ("SELECT julianday(ts) FROM messages WHERE room=? AND seq BETWEEN ? AND ?"
+         " AND julianday(ts) IS NOT NULL ORDER BY ts %s LIMIT 1 OFFSET ?")
+    lo = con.execute(q % "ASC", (room, min_seq, max_seq, k)).fetchone()
+    hi = con.execute(q % "DESC", (room, min_seq, max_seq, k)).fetchone()
+    span = None if lo is None or hi is None else (hi[0] - lo[0]) * 86400
+    if span is None or span <= 0:
+        log.warning("[%s] ring lifetime not measurable (no parseable ts, single "
+                    "message, or non-positive trimmed span) — export interval "
+                    "unchanged", room)
         return
-    lifetime = float(row[0])
+    lifetime = float(span)
     interval = int(min(EXPORT_INTERVAL_SEC,
                        max(EXPORT_MIN_SEC, lifetime * EXPORT_LIFETIME_FRACTION)))
     meta_set(con, f"export_interval:{room}", str(interval))
-    log.info("[%s] ring lifetime %.0fm (%ds) → next export in %dm (%ds)",
+    log.info("[%s] ring lifetime (1–99%% trimmed) %.0fm (%ds) → next export in %dm (%ds)",
              room, lifetime / 60, int(lifetime), interval // 60, interval)
 
 
