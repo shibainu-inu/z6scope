@@ -72,7 +72,14 @@
    - 09-07 09:0x: 最小値 × 0.5 を実装、テスト 9 ケース合格、reviewer REQUEST_CHANGES（文書のみ）→ 全件適用。
    - 09-07 09:15 JST: min 版で再起動（pid 525298）。**24 時間の起点を再設定 = 09-07 09:15:09 JST（epoch 1788740109）**。
      以後のギャップ確認は `detected_at >= 1788740109`。係数は 0.5 のまま（オーナー判断: min の効果を 24 時間で切り分け）。
-   - チェック 4（09-07 の翌日 09:15 JST）: 未実施
+   - 09-07 18:04:21 JST: min 版で初の喪失 **kibble 3,639 seq**（2 区間、記録済み）。17:32 の export から
+     32 分でリングが完全に一周（max 2228649 → 最古 2232683; `SELECT gap_start,gap_end FROM coverage_gaps
+     WHERE room='kibble' AND detected_at>=1788740109`）。「1 間隔内に 2 倍超縮む」型で、min では
+     防げない種類（reviewer のリプレイどおり）。夕方の帯（17–20 時 JST）。
+   - 09-07 19:5x JST: オーナー承認で **Plan A（レート追従）** と **Plan B（上流事実で文書更新）** を
+     同ターンで実装。A: `adapt_from_rate()` / `rate_interval()`、テスト r0–r11 合格。B: DECISIONS /
+     STRATEGY / docstring / rooms.json コメント / CLAUDE.md / findings §1。reviewer 待ち、未コミット。
+   - チェック 4（09-08 09:15 JST）: 未実施
    - 完了条件:
      - 09-03 20:26:48 JST から 24 時間、4 ルームすべてに各自の `export_interval`
        （+1 サイクル）以内の `export:` ログがある（欠けがあれば理由と時刻を記録）
@@ -100,9 +107,10 @@
 
 ## Next
 
-- `collector.py` 冒頭のモジュール docstring（12–15 行目）が今も「forward paging only /
-  `since` returns messages with a GREATER seq」と述べている。README で直した誤りと同じ。
-  コード変更は別プランで（reviewer 指摘、09-04）
+- **上流ウォッチ（09-07 初回、`docs/upstream-2026-09-07.md`）の推奨 9 件**（すべて**未決**）:
+  `X-Room-Generation` の記録 / 保持仕様変更（0.11.3, 09-02）の注記 / byte budget 監視 /
+  issue #775 ウォッチ / #481 併記 / 503 記述の日付化 / 空 export の挙動明記 / `tclk-offers` の扱い /
+  docstring の再検証日更新。定期化するかも**未決**。
 - Stage 2 の指標を決める（**未決**）。候補は `docs/findings-2026-09-03.md` §4:
   テンプレ/非テンプレ比率と推移、テンプレ伝播波形、新規 DID 流入率、
   ルーム間橋渡し数、ルーム別本文長・ユニーク率

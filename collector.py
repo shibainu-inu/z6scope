@@ -9,14 +9,17 @@ The publication layer (site JSON) is a separate tool and is NOT here.
 Read-only by construction: this program only issues GET requests.
 It never posts, never writes to the server, never creates keys.
 
-API facts verified against /openapi.json (2026-09-02):
-  - GET /r/{room}?format=json&limit=N&since=SEQ  (forward paging only;
-    `since` returns messages with a GREATER seq — there is no backward
-    paging parameter)
-  - `n` query param: ignored by the server, varies the URL past a cache
-    (used here as a cache-buster on every request)
-  - GET /r/{room}/export exists (used for --backfill; format verified at
-    first run — raw is archived even if parsing is not yet wired)
+API facts verified against /openapi.json (2026-09-02, re-verified 2026-09-07
+against v0.13.0, sha256 f5bece6c…823b3):
+  - GET /r/{room}?format=json&limit=N&since=SEQ — `since` filters to greater
+    seqs but the 200 cap is applied from the NEWEST end, so it only ever
+    tracks the head (measured 2026-09-02; upstream issue #481 agrees).
+    `limit` is clamped to 1..200, invalid values fall back to 50.
+  - `n` query param: ignored by the server, varies the URL past the CDN
+    (reads are edge-cached up to `edge_cache_seconds`=5; the cache-buster
+    keeps head polls at the origin)
+  - GET /r/{room}/export: the whole surviving ring as JSONL, bytes as
+    written, no query parameters; a missing room exports as an empty body
 
 Usage:
   python3 collector.py --once            # one polling cycle over all rooms
@@ -66,6 +69,16 @@ EXPORT_INTERVAL_SEC = 3600  # UPPER bound for the per-room /export interval —
                             # of 2026-09-03, when a fixed hour lost ~19k seqs.
 EXPORT_MIN_SEC = 600        # lower bound — politeness floor even for a room
                             # whose ring turns over in minutes
+RATE_SAMPLE_MIN_SEC = 180       # head-poll rate samples: ignore pairs closer
+                            # than this. At 60 s (the FAST_RETRY cycle, i.e.
+                            # right after a 503) 12% of kibble samples on
+                            # 2026-09-07 evening pinned the floor; at 300 s
+                            # none did, and the normal cycle is 300 s anyway.
+RATE_SAMPLE_MAX_SEC = 1200      # ... or further apart than this (a stalled
+                            # loop would average over a burst and miss it)
+RATE_FRESH_SEC = 900            # a rate-derived interval older than this is
+                            # ignored so a stale sample cannot keep exports
+                            # short (or long) after polling stops
 EXPORT_LIFETIME_TRIM = 0.01     # drop this fraction of ts at each end before
                             # measuring the ring lifetime (outlier guard)
 EXPORT_LIFETIME_FRACTION = 0.5  # interval = ring lifetime × this. The timer
@@ -398,6 +411,7 @@ def poll_room(con: sqlite3.Connection, room: str) -> bool:
     cursor = stored_max_seq(con, room)
     total_new = 0
     busy = False
+    got_page = False            # a page actually parsed this cycle
     for page in range(MAX_PAGES_PER_CYCLE):
         fetched_at = int(time.time())
         try:
@@ -415,6 +429,7 @@ def poll_room(con: sqlite3.Connection, room: str) -> bool:
         r = ingest(con, room, payload, fetched_at, raw_file)
         if r["parsed"] == 0:
             break
+        got_page = True
         if page == 0:
             if cursor is None:
                 meta_set(con, f"first_observed:{room}", str(r["min_seq"]))
@@ -437,6 +452,11 @@ def poll_room(con: sqlite3.Connection, room: str) -> bool:
         log.warning("[%s] page cap (%d) hit — fast retry next cycle",
                     room, MAX_PAGES_PER_CYCLE)
         busy = True
+    if got_page and not busy and cursor is not None:
+        # Sample only when this cycle really read the head: a failed or
+        # unparseable poll would record a stale seq with a fresh timestamp and
+        # inflate the next rate estimate (shorter interval, more exports).
+        adapt_from_rate(con, room, cursor)
     log.info("[%s] new=%d cursor=%s%s", room, total_new, cursor,
              " (behind, fast retry)" if busy else "")
     return busy
@@ -548,9 +568,61 @@ def recover_via_export(con: sqlite3.Connection, room: str) -> dict:
         log.info("[%s] export: parsed=%d new=%d seq %d..%d",
                  room, r["parsed"], r["inserted"], r["min_seq"], r["max_seq"])
         adapt_export_interval(con, room, r["min_seq"], r["max_seq"])
+        meta_set(con, f"ring_count:{room}", str(r["parsed"]))   # for adapt_from_rate
     else:
         log.warning("[%s] export not parsed — raw archived at %s", room, raw_file)
     return r
+
+
+def adapt_from_rate(con: sqlite3.Connection, room: str, head_seq: int) -> None:
+    """Re-estimate the ring lifetime between exports from the head-poll rate.
+
+    adapt_export_interval() only sees the ring when an export runs; in the
+    17–20 JST bursts (2026-09-04..07) the lifetime halved within one interval
+    and 186–3,963 seqs were lost per event even with the min-of-two rule. The
+    head poll already tells us the newest seq every cycle for free, so
+    lifetime ≈ (messages in the last export) / (seqs per second now). The
+    result is stored with its timestamp; maybe_periodic_export takes the
+    shorter of this and the export-derived interval while it is fresh.
+    Limit: bodies growing larger shrink the ring in messages without changing
+    the seq rate — that part is only seen at the next export.
+    """
+    now = int(time.time())
+    prev = meta_get(con, f"head_sample:{room}")
+    meta_set(con, f"head_sample:{room}", f"{head_seq},{now}")
+    ring = meta_get(con, f"ring_count:{room}")
+    if prev is None or ring is None:
+        return
+    try:
+        prev_seq, prev_t = (int(x) for x in prev.split(","))
+        ring_n = int(ring)
+    except ValueError:
+        return
+    dt = now - prev_t
+    if not (RATE_SAMPLE_MIN_SEC <= dt <= RATE_SAMPLE_MAX_SEC) or ring_n <= 0:
+        return
+    rate = (head_seq - prev_seq) / dt
+    if rate <= 0:
+        return                      # idle room: no constraint from the rate
+    lifetime = ring_n / rate
+    interval = int(min(EXPORT_INTERVAL_SEC,
+                       max(EXPORT_MIN_SEC, lifetime * EXPORT_LIFETIME_FRACTION)))
+    meta_set(con, f"export_interval_rate:{room}", f"{interval},{now}")
+    log.info("[%s] head rate %.0f seq/min over %ds → lifetime ~%.0fm → rate-bound "
+             "export interval %dm (%ds)", room, rate * 60, dt, lifetime / 60,
+             interval // 60, interval)
+
+
+def rate_interval(con: sqlite3.Connection, room: str) -> float | None:
+    """The rate-derived interval if its sample is still fresh, else None."""
+    v = meta_get(con, f"export_interval_rate:{room}")
+    if v is None:
+        return None
+    try:
+        interval, at = (int(x) for x in v.split(","))
+    except ValueError:
+        return None
+    return float(interval) if time.time() - at <= RATE_FRESH_SEC else None
 
 
 def maybe_periodic_export(con: sqlite3.Connection, room: str) -> None:
@@ -565,6 +637,9 @@ def maybe_periodic_export(con: sqlite3.Connection, room: str) -> None:
     """
     last = meta_get(con, f"last_export:{room}")
     interval = float(meta_get(con, f"export_interval:{room}") or EXPORT_INTERVAL_SEC)
+    r_iv = rate_interval(con, room)
+    if r_iv is not None:
+        interval = min(interval, r_iv)      # between exports, trust the live rate
     if last is not None and time.time() - float(last) < interval:
         return
     try:
