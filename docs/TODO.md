@@ -79,7 +79,9 @@
    - 09-07 19:5x JST: オーナー承認で **Plan A（レート追従）** と **Plan B（上流事実で文書更新）** を
      同ターンで実装。A: `adapt_from_rate()` / `rate_interval()`、テスト r0–r11 合格。B: DECISIONS /
      STRATEGY / docstring / rooms.json コメント / CLAUDE.md / findings §1。reviewer 待ち、未コミット。
-   - チェック 4（09-08 09:15 JST）: 未実施
+   - 09-07 20:43 JST: レート追従版で再起動（pid 555116、reviewer 指摘全件適用）。
+     **24 時間の起点を再設定 = 09-07 20:43:09 JST（epoch 1788781389）**。ギャップ確認は `detected_at >= 1788781389`。
+   - チェック 4（09-08 20:43 JST）: 未実施
    - 完了条件:
      - 09-03 20:26:48 JST から 24 時間、4 ルームすべてに各自の `export_interval`
        （+1 サイクル）以内の `export:` ログがある（欠けがあれば理由と時刻を記録）
