@@ -14,7 +14,11 @@ aggregation + static site. Stage 3 = testnet explorer.
    or commit without it.
 3. **End**: update `docs/TODO.md` (move items, add completion evidence
    with dates) and, if a decision was made, `docs/DECISIONS.md`.
-4. Details of what is true about the server live in
+4. **Every morning, with the daily check**: run the upstream watch (read-only
+   agent; diff GitHub commits/issues/releases and `/openapi.json` against
+   the last `docs/upstream-*.md`; always check issue #775) and write
+   `docs/upstream-YYYY-MM-DD.md` if anything changed.
+5. Details of what is true about the server live in
    `docs/findings-2026-09-03.md` and `docs/DECISIONS.md` — re-verify from
    raw data before relying on them (rule 7).
 
@@ -57,8 +61,10 @@ aggregation + static site. Stage 3 = testnet explorer.
 
 Runs on the home PC in tmux session `z6scope`. The periodic `/export` is the
 only complete data source. Its interval adapts per room to half of
-min(this, previous) 1–99%-trimmed ring lifetime (10 min – 1 h,
-`meta.export_interval:*`, memory in `meta.ring_lifetime_prev:*`); if the loop
+min(this, previous) 1–99%-trimmed ring lifetime (`meta.export_interval:*`,
+memory in `meta.ring_lifetime_prev:*`), further shortened between exports by
+a live estimate from the head-poll seq rate (`meta.export_interval_rate:*`,
+inputs `ring_count:*` / `head_sample:*`); range 10 min – 1 h. If the loop
 stops for longer than a busy room's ring lifetime (~20–60 min), data is
 lost for good.
 
@@ -80,7 +86,10 @@ sqlite3 data/z6scope.sqlite3 "SELECT room, COUNT(*), MAX(seq) FROM messages GROU
 sqlite3 data/z6scope.sqlite3 "SELECT room, COUNT(*), SUM(gap_end-gap_start+1) FROM coverage_gaps WHERE detected_at >= strftime('%s','now')-86400 GROUP BY room;"
 sqlite3 data/z6scope.sqlite3 "SELECT * FROM parse_failures ORDER BY fetched_at DESC LIMIT 5;"
 sqlite3 data/z6scope.sqlite3 "SELECT key, datetime(value,'unixepoch') FROM meta WHERE key LIKE 'last_export:%';"
-sqlite3 data/z6scope.sqlite3 "SELECT key, value FROM meta WHERE key LIKE 'export_interval:%' OR key LIKE 'ring_lifetime_prev:%';"
+sqlite3 data/z6scope.sqlite3 "SELECT key, value FROM meta WHERE key LIKE 'export_interval%' OR key LIKE 'ring_lifetime_prev:%' OR key LIKE 'ring_count:%' OR key LIKE 'head_sample:%';"
+# optional, one GET: global byte budget (per-room floor drops to 32 KiB when it fills).
+# /rooms is served from an edge copy since 2026-09-02, so treat the numbers as possibly stale.
+curl -s -A z6scope-healthcheck 'https://technocore.chat/rooms?format=json&limit=1' | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('bytes'), '/', d.get('bytes_capacity'))"
 ```
 
 Healthy = counts growing, each `last_export:*` within its room's

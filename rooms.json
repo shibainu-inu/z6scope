@@ -1,5 +1,5 @@
 {
-  "_comment": "z6scope observation points. Add HTLC receipt rooms here once their location is confirmed — the collector reloads this file every cycle, no restart needed.",
+  "_comment": "z6scope observation points; reloaded every cycle, no restart needed. HTLC (tclk/1, upstream patterns.md §6, checked 2026-09-07): public offers/accepts rest in the ordinary room `tclk-offers`; the actual deal rooms `mb-p-tclk-<id16>` are unlisted and cannot be observed. Adding `tclk-offers` is undecided (docs/TODO.md).",
   "rooms": [
     "technocore",
     "inference-agents",
