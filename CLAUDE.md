@@ -56,8 +56,9 @@ aggregation + static site. Stage 3 = testnet explorer.
 ## Operations
 
 Runs on the home PC in tmux session `z6scope`. The periodic `/export` is the
-only complete data source. Its interval adapts per room to half the ring's
-observed lifetime (10 min – 1 h, `meta.export_interval:*`); if the loop
+only complete data source. Its interval adapts per room to half of
+min(this, previous) 1–99%-trimmed ring lifetime (10 min – 1 h,
+`meta.export_interval:*`, memory in `meta.ring_lifetime_prev:*`); if the loop
 stops for longer than a busy room's ring lifetime (~20–60 min), data is
 lost for good.
 
@@ -79,7 +80,7 @@ sqlite3 data/z6scope.sqlite3 "SELECT room, COUNT(*), MAX(seq) FROM messages GROU
 sqlite3 data/z6scope.sqlite3 "SELECT room, COUNT(*), SUM(gap_end-gap_start+1) FROM coverage_gaps WHERE detected_at >= strftime('%s','now')-86400 GROUP BY room;"
 sqlite3 data/z6scope.sqlite3 "SELECT * FROM parse_failures ORDER BY fetched_at DESC LIMIT 5;"
 sqlite3 data/z6scope.sqlite3 "SELECT key, datetime(value,'unixepoch') FROM meta WHERE key LIKE 'last_export:%';"
-sqlite3 data/z6scope.sqlite3 "SELECT key, value FROM meta WHERE key LIKE 'export_interval:%';"
+sqlite3 data/z6scope.sqlite3 "SELECT key, value FROM meta WHERE key LIKE 'export_interval:%' OR key LIKE 'ring_lifetime_prev:%';"
 ```
 
 Healthy = counts growing, each `last_export:*` within its room's

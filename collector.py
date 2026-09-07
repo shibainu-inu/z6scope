@@ -473,8 +473,10 @@ def record_losses_below(con: sqlite3.Connection, room: str, ring_min: int) -> No
 def adapt_export_interval(con: sqlite3.Connection, room: str,
                           min_seq: int, max_seq: int) -> None:
     """Set the room's export interval to a fraction of the ring's observed
-    lifetime (1%–99% trimmed ts span of what the export returned), clamped
-    to [EXPORT_MIN_SEC, EXPORT_INTERVAL_SEC]. SQLite parses the server's
+    lifetime (1%–99% trimmed ts span of what the export returned, taking the
+    min with the previous export's value), clamped to
+    [EXPORT_MIN_SEC, EXPORT_INTERVAL_SEC]. An unmeasurable ring leaves both the
+    interval and the remembered previous lifetime untouched. SQLite parses the server's
     `…Z` timestamps; Python 3.10's fromisoformat does not. A ring whose span
     cannot be measured (bad ts, single message) keeps the previous value."""
     # Trimmed span, not MAX-MIN: on 2026-09-04 a single message whose ts was
@@ -506,11 +508,28 @@ def adapt_export_interval(con: sqlite3.Connection, room: str,
                     "unchanged", room)
         return
     lifetime = float(span)
+    # Base the interval on the SHORTER of this and the previous measurement.
+    # From 2026-09-04 to 09-07 the lifetime repeatedly fell by half within one
+    # interval — peaking 17–20 JST but ~17% of the loss came at other hours —
+    # and the half-margin alone lost 186–3,963 seqs per event (SQL in
+    # docs/DECISIONS.md 2026-09-07). The min reacts at once when the ring
+    # shrinks and lags one export when it grows back; replaying 87 archived
+    # kibble exports put the extra load at 1.12× (kibble) / 1.07× (technocore).
+    # Known limits: a drop steeper than 2× within one interval still loses,
+    # and a manual --backfill right after a periodic export overwrites the
+    # remembered dip with a duplicate measurement.
+    prev = meta_get(con, f"ring_lifetime_prev:{room}")
+    try:
+        basis = min(lifetime, float(prev)) if prev is not None else lifetime
+    except ValueError:            # hand-edited meta; ignore it rather than crash
+        basis = lifetime
+    meta_set(con, f"ring_lifetime_prev:{room}", str(int(lifetime)))
     interval = int(min(EXPORT_INTERVAL_SEC,
-                       max(EXPORT_MIN_SEC, lifetime * EXPORT_LIFETIME_FRACTION)))
+                       max(EXPORT_MIN_SEC, basis * EXPORT_LIFETIME_FRACTION)))
     meta_set(con, f"export_interval:{room}", str(interval))
-    log.info("[%s] ring lifetime (1–99%% trimmed) %.0fm (%ds) → next export in %dm (%ds)",
-             room, lifetime / 60, int(lifetime), interval // 60, interval)
+    log.info("[%s] ring lifetime (1–99%% trimmed) %.0fm (%ds), basis min(this, prev) "
+             "%.0fm → next export in %dm (%ds)",
+             room, lifetime / 60, int(lifetime), basis / 60, interval // 60, interval)
 
 
 def recover_via_export(con: sqlite3.Connection, room: str) -> dict:
