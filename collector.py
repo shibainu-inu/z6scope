@@ -190,14 +190,19 @@ def meta_set(con: sqlite3.Connection, key: str, value: str) -> None:
 # fetch (GET only)
 # ----------------------------------------------------------------------------
 def http_get(url: str, timeout: int = HTTP_TIMEOUT,
-             retries: int = RETRIES) -> bytes:
+             retries: int = RETRIES, headers_out: dict | None = None) -> bytes:
     """GET with polite backoff. `retries=1` is for the slow /export path so a
-    stalled export cannot block the whole cycle for ~8 min (5 × 90 s)."""
+    stalled export cannot block the whole cycle for ~8 min (5 × 90 s).
+    If `headers_out` is a dict, the response headers are copied into it
+    (lower-case keys) — the raw archive keeps bodies only, and /export's
+    X-Room-Generation lives in a header."""
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
     last_err: Exception | None = None
     for attempt in range(1, retries + 1):
         try:
             with urllib.request.urlopen(req, timeout=timeout) as resp:
+                if headers_out is not None:
+                    headers_out.update({k.lower(): v for k, v in resp.headers.items()})
                 return resp.read()
         except urllib.error.HTTPError as e:
             last_err = e
@@ -552,6 +557,44 @@ def adapt_export_interval(con: sqlite3.Connection, room: str,
              room, lifetime / 60, int(lifetime), basis / 60, interval // 60, interval)
 
 
+def note_room_generation(con: sqlite3.Connection, room: str,
+                         gen: str | None, at: int) -> None:
+    """Track /export's X-Room-Generation header — the room's conversation
+    epoch per openapi v0.13.0 (docs/upstream-2026-09-07.md §3). What happens
+    to it on reap/recreate is still an open contract point in upstream #775,
+    so "a recreate bumps it" is assumed here, not verified.
+
+    Our seq-contiguity premise (record_losses_below, docs/coverage.sql) only
+    holds within one generation, and #775 treats generation as the boundary
+    too. A change is logged and appended to meta so coverage can be scoped
+    later; `at` is the fetch time of the first PARSEABLE export showing the
+    new value (a reaped room exports an empty body, which never reaches this
+    function), i.e. an upper bound on the boundary. The loss scan is left
+    alone on purpose: if seqs continue across the boundary the missing range
+    really is gone; if they restart below the floor the scan skips itself,
+    last_export_max then moves BACKWARDS, and new-generation messages whose
+    seq collides with retained rows are dropped by INSERT OR IGNORE — an
+    under-recording, never an over-recording, so the WARNING is a signal for
+    an owner decision (separate plan), not something this code resolves. The
+    header is not in the raw archive, so meta is the only record; the
+    history field is for humans and is not parsed anywhere.
+    """
+    if gen is None:
+        return                      # older server or a proxy that strips it
+    prev = meta_get(con, f"room_generation:{room}")
+    if prev is None:
+        meta_set(con, f"room_generation:{room}", gen)
+        log.info("[%s] room generation %s (first seen)", room, gen)
+    elif prev != gen:
+        hist = meta_get(con, f"room_generation_changed:{room}") or ""
+        meta_set(con, f"room_generation_changed:{room}",
+                 (hist + ";" if hist else "") + f"{prev}>{gen},{at}")
+        meta_set(con, f"room_generation:{room}", gen)
+        log.warning("[%s] room generation changed %s → %s: seq continuity across "
+                    "this boundary is not guaranteed (reap/recreate assumed; see "
+                    "docs/DECISIONS.md 2026-09-08)", room, prev, gen)
+
+
 def recover_via_export(con: sqlite3.Connection, room: str) -> dict:
     """Fetch the whole surviving ring via /export and ingest it.
 
@@ -559,10 +602,13 @@ def recover_via_export(con: sqlite3.Connection, room: str) -> dict:
     oldest seq are recorded as permanent losses and the scan floor advances.
     """
     fetched_at = int(time.time())
-    payload = http_get(export_url(room), timeout=EXPORT_TIMEOUT, retries=1)
+    headers: dict = {}
+    payload = http_get(export_url(room), timeout=EXPORT_TIMEOUT, retries=1,
+                       headers_out=headers)
     raw_file = save_raw(room, payload, fetched_at, kind="export")
     r = ingest(con, room, payload, fetched_at, raw_file)
     if r["parsed"]:
+        note_room_generation(con, room, headers.get("x-room-generation"), fetched_at)
         record_losses_below(con, room, r["min_seq"])
         meta_set(con, f"last_export_max:{room}", str(r["max_seq"]))
         log.info("[%s] export: parsed=%d new=%d seq %d..%d",

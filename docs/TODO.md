@@ -81,6 +81,15 @@
      STRATEGY / docstring / rooms.json コメント / CLAUDE.md / findings §1。reviewer 待ち、未コミット。
    - 09-07 20:43 JST: レート追従版で再起動（pid 555116、reviewer 指摘全件適用）。
      **24 時間の起点を再設定 = 09-07 20:43:09 JST（epoch 1788781389）**。ギャップ確認は `detected_at >= 1788781389`。
+   - 09-07 20:50:20 JST: kibble **87 seq 喪失**（2337022..2337108、記録済み）。リング 20,485 → 9,935 件に
+     16 分で半減。kibble は新コード初回 export で `ring_count` 未設定のためレート推定は未適用（再起動直後の空白）。
+   - 中間確認（09-08 09:04 JST、レート追従版 +12.4 時間）: 喪失は 20:50 の kibble 87 seq のみ（初回 export の空白）、
+     以後 0。parse_failures 0。export: credence 11 / inference-agents 12 / kibble 36 / technocore 22、最大間隔
+     kibble 31.1 分・technocore 59.1 分・他 65.6 分。上流ウォッチ: 変化は #775 のコメントのみ（追記済み）。
+   - 09-08 09:2x JST: (b) `X-Room-Generation` 記録を実装（`http_get(headers_out=)`、`note_room_generation()`）、
+     テスト g1–g11 合格、reviewer APPROVE（SHOULD 2 件適用）。実測: credence の export は
+     `x-room-generation: 0`（存在するルームが 0 = 上流文書と食い違い、DECISIONS に記録）。
+     コミット済み。**再起動はチェック 4（20:43）の後**（レート追従版の 24 時間評価を壊さないため、オーナー判断）。
    - チェック 4（09-08 20:43 JST）: 未実施
    - 完了条件:
      - 09-03 20:26:48 JST から 24 時間、4 ルームすべてに各自の `export_interval`

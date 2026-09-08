@@ -86,7 +86,7 @@ sqlite3 data/z6scope.sqlite3 "SELECT room, COUNT(*), MAX(seq) FROM messages GROU
 sqlite3 data/z6scope.sqlite3 "SELECT room, COUNT(*), SUM(gap_end-gap_start+1) FROM coverage_gaps WHERE detected_at >= strftime('%s','now')-86400 GROUP BY room;"
 sqlite3 data/z6scope.sqlite3 "SELECT * FROM parse_failures ORDER BY fetched_at DESC LIMIT 5;"
 sqlite3 data/z6scope.sqlite3 "SELECT key, datetime(value,'unixepoch') FROM meta WHERE key LIKE 'last_export:%';"
-sqlite3 data/z6scope.sqlite3 "SELECT key, value FROM meta WHERE key LIKE 'export_interval%' OR key LIKE 'ring_lifetime_prev:%' OR key LIKE 'ring_count:%' OR key LIKE 'head_sample:%';"
+sqlite3 data/z6scope.sqlite3 "SELECT key, value FROM meta WHERE key LIKE 'export_interval%' OR key LIKE 'ring_lifetime_prev:%' OR key LIKE 'ring_count:%' OR key LIKE 'head_sample:%' OR key LIKE 'room_generation%';"
 # optional, one GET: global byte budget (per-room floor drops to 32 KiB when it fills).
 # /rooms is served from an edge copy since 2026-09-02, so treat the numbers as possibly stale.
 curl -s -A z6scope-healthcheck 'https://technocore.chat/rooms?format=json&limit=1' | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('bytes'), '/', d.get('bytes_capacity'))"

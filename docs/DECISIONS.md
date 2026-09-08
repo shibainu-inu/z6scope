@@ -3,6 +3,18 @@
 決めたことだけを書く。未決は `docs/TODO.md` にある。
 形式: 日付 — 決定 — 理由 — 根拠（commit / 会話）。
 
+## 2026-09-08
+
+- **`/export` の `X-Room-Generation` を毎回記録し、変化時は警告 + `meta.room_generation_changed:{room}`
+  に履歴を残す**（観測方法の更新 (b)）— seq 連番前提は同一 generation 内でのみ成立し、上流 #775 でも
+  generation が境界として扱われる方向（09-08 差分ウォッチ）。喪失走査は変更しない（seq が継続なら
+  欠落は真の喪失、巻き戻れば走査は自然にスキップ）。ヘッダは raw に残らないので meta のみが記録。
+  `http_get(headers_out=)` を追加、既存呼び出しは無変更。— オーナー承認（Plan）。
+  実測（09-08 09:29 JST、`curl -s -D - -o /dev/null https://technocore.chat/r/credence/export`）:
+  HTTP 200、`x-room-generation: 0`、`content-type: application/x-ndjson`。**存在する 5,891 件のルームが 0**
+  なので、上流文書の「0 = ルームが存在したことがない」は現行挙動と食い違う（ルール 7: 文書より実測）。
+  reap/再作成で増えるかは未検証（#775 の未決事項）。
+
 ## 2026-09-07（上流ウォッチ初回、`docs/upstream-2026-09-07.md`）
 
 - **上流の事実で前提を更新**（コード変更なし、docstring コメントのみ）:
