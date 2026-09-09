@@ -63,8 +63,9 @@ Runs on the home PC in tmux session `z6scope`. The periodic `/export` is the
 only complete data source. Its interval adapts per room to half of
 min(this, previous) 1–99%-trimmed ring lifetime (`meta.export_interval:*`,
 memory in `meta.ring_lifetime_prev:*`), further shortened between exports by
-a live estimate from the head-poll seq rate (`meta.export_interval_rate:*`,
-inputs `ring_count:*` / `head_sample:*`); range 10 min – 1 h. If the loop
+the shortest of the last 15 min of head-poll rate estimates
+(`meta.export_interval_rate:*` holds `i,t;i,t;…`, inputs `ring_count:*` /
+`head_sample:*`); range 10 min – 1 h. If the loop
 stops for longer than a busy room's ring lifetime (~20–60 min), data is
 lost for good.
 

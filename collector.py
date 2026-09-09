@@ -76,9 +76,15 @@ RATE_SAMPLE_MIN_SEC = 180       # head-poll rate samples: ignore pairs closer
                             # none did, and the normal cycle is 300 s anyway.
 RATE_SAMPLE_MAX_SEC = 1200      # ... or further apart than this (a stalled
                             # loop would average over a burst and miss it)
-RATE_FRESH_SEC = 900            # a rate-derived interval older than this is
-                            # ignored so a stale sample cannot keep exports
-                            # short (or long) after polling stops
+RATE_FRESH_SEC = 900            # rate-derived intervals older than this are
+                            # dropped so a stale sample cannot keep exports
+                            # short (or long) after polling stops. Within the
+                            # window the SHORTEST is used: on 2026-09-08 the
+                            # 5-min rate swung 198→588→291→529 seq/min and a
+                            # low sample overwrote the high one — kibble lost
+                            # 1,414 seqs at 20:42 that the export due from the
+                            # 20:23 estimate (next cycle after 20:32) would
+                            # have caught.
 EXPORT_LIFETIME_TRIM = 0.01     # drop this fraction of ts at each end before
                             # measuring the ring lifetime (outlier guard)
 EXPORT_LIFETIME_FRACTION = 0.5  # interval = ring lifetime × this. The timer
@@ -653,22 +659,44 @@ def adapt_from_rate(con: sqlite3.Connection, room: str, head_seq: int) -> None:
     lifetime = ring_n / rate
     interval = int(min(EXPORT_INTERVAL_SEC,
                        max(EXPORT_MIN_SEC, lifetime * EXPORT_LIFETIME_FRACTION)))
-    meta_set(con, f"export_interval_rate:{room}", f"{interval},{now}")
+    # keep every sample still inside the freshness window ("i,t;i,t;..."). The
+    # [-8:] cap is free — samples are ≥ RATE_SAMPLE_MIN_SEC apart (head_sample
+    # is rewritten even for rejected ones), so at most 6 can be fresh — and it
+    # is what eventually evicts a future-dated entry after a clock step, which
+    # the age test alone would keep forever.
+    kept = [e for e in _rate_entries(con, room) if now - e[1] <= RATE_FRESH_SEC]
+    kept.append((interval, now))
+    meta_set(con, f"export_interval_rate:{room}",
+             ";".join(f"{i},{t}" for i, t in kept[-8:]))
     log.info("[%s] head rate %.0f seq/min over %ds → lifetime ~%.0fm → rate-bound "
              "export interval %dm (%ds)", room, rate * 60, dt, lifetime / 60,
              interval // 60, interval)
 
 
-def rate_interval(con: sqlite3.Connection, room: str) -> float | None:
-    """The rate-derived interval if its sample is still fresh, else None."""
+def _rate_entries(con: sqlite3.Connection, room: str) -> list[tuple[int, int]]:
+    """Parse meta.export_interval_rate:{room} ("i,t;i,t;..."); bad parts skipped."""
     v = meta_get(con, f"export_interval_rate:{room}")
-    if v is None:
-        return None
-    try:
-        interval, at = (int(x) for x in v.split(","))
-    except ValueError:
-        return None
-    return float(interval) if time.time() - at <= RATE_FRESH_SEC else None
+    out: list[tuple[int, int]] = []
+    dropped = 0
+    for part in (v or "").split(";"):
+        try:
+            i, t = (int(x) for x in part.split(","))
+            out.append((i, t))
+        except ValueError:
+            dropped += 1
+    if dropped and v:
+        log.warning("[%s] export_interval_rate: %d malformed part(s) ignored (%r)",
+                    room, dropped, v[:80])
+    return out
+
+
+def rate_interval(con: sqlite3.Connection, room: str) -> float | None:
+    """The SHORTEST rate-derived interval among samples still within
+    RATE_FRESH_SEC, else None. Min, not latest: a single low-rate sample must
+    not cancel a burst seen one cycle earlier (see RATE_FRESH_SEC)."""
+    now = time.time()
+    fresh = [i for i, t in _rate_entries(con, room) if now - t <= RATE_FRESH_SEC]
+    return float(min(fresh)) if fresh else None
 
 
 def maybe_periodic_export(con: sqlite3.Connection, room: str) -> None:
