@@ -659,12 +659,16 @@ def adapt_from_rate(con: sqlite3.Connection, room: str, head_seq: int) -> None:
     lifetime = ring_n / rate
     interval = int(min(EXPORT_INTERVAL_SEC,
                        max(EXPORT_MIN_SEC, lifetime * EXPORT_LIFETIME_FRACTION)))
-    # keep every sample still inside the freshness window ("i,t;i,t;..."). The
-    # [-8:] cap is free — samples are ≥ RATE_SAMPLE_MIN_SEC apart (head_sample
-    # is rewritten even for rejected ones), so at most 6 can be fresh — and it
-    # is what eventually evicts a future-dated entry after a clock step, which
-    # the age test alone would keep forever.
-    kept = [e for e in _rate_entries(con, room) if now - e[1] <= RATE_FRESH_SEC]
+    # keep every sample still inside the freshness window ("i,t;i,t;...").
+    # Future-dated entries (clock stepped back) are dropped outright: pruning
+    # keeps the list short, so the [-8:] cap would never reach them and a bogus
+    # short interval would pin the min forever. The cost: after a backward
+    # step legitimate samples are discarded too and the timer falls back to
+    # the longer export-derived interval until new samples accumulate — it
+    # fails toward the upper bound, never toward a bogus floor. The cap is a
+    # plain size bound; samples are ≥ RATE_SAMPLE_MIN_SEC apart so at most 6
+    # can be fresh.
+    kept = [e for e in _rate_entries(con, room) if 0 <= now - e[1] <= RATE_FRESH_SEC]
     kept.append((interval, now))
     meta_set(con, f"export_interval_rate:{room}",
              ";".join(f"{i},{t}" for i, t in kept[-8:]))
@@ -695,7 +699,7 @@ def rate_interval(con: sqlite3.Connection, room: str) -> float | None:
     RATE_FRESH_SEC, else None. Min, not latest: a single low-rate sample must
     not cancel a burst seen one cycle earlier (see RATE_FRESH_SEC)."""
     now = time.time()
-    fresh = [i for i, t in _rate_entries(con, room) if now - t <= RATE_FRESH_SEC]
+    fresh = [i for i, t in _rate_entries(con, room) if 0 <= now - t <= RATE_FRESH_SEC]
     return float(min(fresh)) if fresh else None
 
 

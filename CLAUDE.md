@@ -103,7 +103,9 @@ fresh parse failures. Log lines
 Import `collector`, point `ROOT`/`DB_PATH`/`RAW_DIR` at a temp dir,
 replace `collector.http_get` with a function returning an archived
 `raw/*.json.gz` body, then call `maybe_periodic_export` / `poll_room` and
-assert on the temp DB. `RAW_DIR` must be under `ROOT`.
+assert on the temp DB. `RAW_DIR` must be under `ROOT`. Never pipe the test
+run through `grep`/`tail` without `set -o pipefail` — on 2026-09-09 a failing
+assertion was masked that way and a broken build was deployed.
 
 ## Prohibited
 
