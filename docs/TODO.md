@@ -110,7 +110,14 @@
      （クロックが後退した場合のみ発生）。09:20 に修正（未来時刻は即時破棄）、pipefail でテスト合格、reviewer 待ち。
    - 09-09 10:14 JST: 未来時刻エントリ修正版で再起動（pid 649901、reviewer APPROVE、テスト h0/h7/h8 追加）。
      **24 時間の起点を再設定 = 09-09 10:14:01 JST（epoch 1788916441）**。ギャップ確認は `detected_at >= 1788916441`。
-   - チェック 5（09-10 10:14 JST）: 未実施
+   - 09-09 17:55:02 JST: kibble **152 seq 喪失**（3338050..3338201、記録済み）。夕方の帯、小規模。
+     再起動（10:14）以降の累計: kibble 152 seq のみ、technocore 0。
+   - チェック 5（09-10 10:14 JST、rate-history-min 版 24 時間）: **合格**。喪失 kibble 152 seq のみ
+     （09-09 17:55、記録済み）、technocore 0。parse_failures 0。export: technocore 49 回（最大 50.1 分）、
+     kibble 90 回（最大 22.7 分）、credence/inference-agents 毎時（最大 72.7 分、上限内）。
+     room_generation は 4 ルームとも 0 のまま（reap/再作成なし）。
+     ビルド比較（24h 喪失）: trim 15,240 → min 3,639 → rate-bound-v1 1,501 → **rate-history-min 152**。
+   - 以後は固定チェックポイントをやめ、監視イベント駆動で報告。次の判断ポイントは喪失再発時のみ。
    - 完了条件:
      - 09-03 20:26:48 JST から 24 時間、4 ルームすべてに各自の `export_interval`
        （+1 サイクル）以内の `export:` ログがある（欠けがあれば理由と時刻を記録）
